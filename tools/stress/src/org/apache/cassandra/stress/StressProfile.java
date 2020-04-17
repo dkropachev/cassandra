@@ -60,6 +60,8 @@ import org.apache.cassandra.stress.util.ResultLogger;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.Constructor;
 import org.yaml.snakeyaml.error.YAMLException;
+import org.apache.cassandra.db.ConsistencyLevel;
+
 
 public class StressProfile implements Serializable
 {
@@ -156,9 +158,12 @@ public class StressProfile implements Serializable
         assert tableName != null : "table name is required in yaml file";
         assert queries != null : "queries map is required in yaml file";
 
-        for (String query : queries.keySet())
+        for (String query : queries.keySet()) {
             assert !tokenRangeQueries.containsKey(query) :
-                String.format("Found %s in both queries and token_range_queries, please use different names", query);
+                    String.format("Found %s in both queries and token_range_queries, please use different names", query);
+            assert query != "insert" :
+                    String.format("Found 'insert' in queries, this name is reserved, please use different name");
+        }
 
         if (keyspaceCql != null && keyspaceCql.length() > 0)
         {
@@ -372,11 +377,28 @@ public class StressProfile implements Serializable
                     Map<String, SchemaStatement.ArgSelect> args = new HashMap<>();
                     for (Map.Entry<String, StressYaml.QueryDef> e : queries.entrySet())
                     {
-                        stmts.put(e.getKey().toLowerCase(), jclient.prepare(e.getValue().cql));
-                        args.put(e.getKey().toLowerCase(), e.getValue().fields == null
+                        StressYaml.QueryDef query = e.getValue();
+                        PreparedStatement stmt = jclient.prepare(query.cql);
+                        String queryName = e.getKey().toLowerCase();
+
+                        if (query.consistencyLevel != null) {
+                            stmt.setConsistencyLevel(JavaDriverClient.from(ConsistencyLevel.valueOf(query.consistencyLevel.toUpperCase())));
+                        } else {
+                            stmt.setConsistencyLevel(JavaDriverClient.from(settings.command.consistencyLevel));
+                        }
+
+                        if (query.serialConsistencyLevel != null) {
+                            stmt.setSerialConsistencyLevel(JavaDriverClient.from(ConsistencyLevel.valueOf(query.serialConsistencyLevel.toUpperCase())));
+                        } else {
+                            stmt.setSerialConsistencyLevel(JavaDriverClient.from(settings.command.serialConsistencyLevel));
+                        }
+
+                        stmts.put(queryName, stmt);
+                        args.put(queryName, query.fields == null
                                 ? SchemaStatement.ArgSelect.MULTIROW
-                                : SchemaStatement.ArgSelect.valueOf(e.getValue().fields.toUpperCase()));
+                                : SchemaStatement.ArgSelect.valueOf(query.fields.toUpperCase()));
                     }
+
                     queryStatements = stmts;
                     argSelects = args;
                 }
@@ -384,9 +406,9 @@ public class StressProfile implements Serializable
         }
 
         if (dynamicConditionExists(queryStatements.get(name)))
-            return new CASQuery(timer, settings, generator, seeds, queryStatements.get(name), settings.command.consistencyLevel, argSelects.get(name), tableName);
+            return new CASQuery(timer, settings, generator, seeds, queryStatements.get(name), argSelects.get(name), tableName);
 
-        return new SchemaQuery(timer, settings, generator, seeds, queryStatements.get(name), settings.command.consistencyLevel, argSelects.get(name));
+        return new SchemaQuery(timer, settings, generator, seeds, queryStatements.get(name), argSelects.get(name));
     }
 
     static boolean dynamicConditionExists(PreparedStatement statement) throws IllegalArgumentException
@@ -549,6 +571,8 @@ public class StressProfile implements Serializable
                         boolean firstCol = true;
                         boolean firstPred = true;
                         for (com.datastax.driver.core.ColumnMetadata c : tableMetaData.getColumns()) {
+                            if (!isTypeSupported(c.getType()))
+                                continue;
 
                             if (keyColumns.contains(c)) {
                                 if (firstPred)
@@ -639,13 +663,30 @@ public class StressProfile implements Serializable
                     String query = sb.toString();
 
                     insertStatement = client.prepare(query);
+
+                    if (insert.containsKey("consistencyLevel")){
+                        insertStatement.setConsistencyLevel(JavaDriverClient.from(ConsistencyLevel.valueOf(insert.get("consistencyLevel").toUpperCase())));
+                    } else if (settings.insert.consistencyLevel != null){
+                        insertStatement.setConsistencyLevel(JavaDriverClient.from(settings.insert.consistencyLevel));
+                    } else {
+                        insertStatement.setConsistencyLevel(JavaDriverClient.from(settings.command.consistencyLevel));
+                    }
+
+                    if (insert.containsKey("serialConsistencyLevel")){
+                        insertStatement.setSerialConsistencyLevel(JavaDriverClient.from(ConsistencyLevel.valueOf(insert.get("serialConsistencyLevel").toUpperCase())));
+                    } else if (settings.insert.serialConsistencyLevel != null){
+                        insertStatement.setSerialConsistencyLevel(JavaDriverClient.from(settings.insert.serialConsistencyLevel));
+                    } else {
+                        insertStatement.setSerialConsistencyLevel(JavaDriverClient.from(settings.command.serialConsistencyLevel));
+                    }
+
                     System.out.println("Insert Statement:");
                     System.out.println("  " + query);
                 }
             }
         }
 
-        return new SchemaInsert(timer, settings, generator, seedManager, partitions.get(), selectchance.get(), rowPopulation.get(), insertStatement, settings.command.consistencyLevel, batchType);
+        return new SchemaInsert(timer, settings, generator, seedManager, partitions.get(), selectchance.get(), rowPopulation.get(), insertStatement, batchType);
     }
 
     public List<ValidatingSchemaQuery> getValidate(Timer timer, PartitionGenerator generator, SeedManager seedManager, StressSettings settings)
@@ -664,7 +705,7 @@ public class StressProfile implements Serializable
 
         List<ValidatingSchemaQuery> queries = new ArrayList<>();
         for (ValidatingSchemaQuery.Factory factory : validationFactories)
-            queries.add(factory.create(timer, settings, generator, seedManager, settings.command.consistencyLevel));
+            queries.add(factory.create(timer, settings, generator, seedManager, settings.command.consistencyLevel, settings.command.serialConsistencyLevel));
         return queries;
     }
 
@@ -680,6 +721,22 @@ public class StressProfile implements Serializable
         return builder.apply(defValue);
     }
 
+    private static boolean isTypeSupported(DataType dataType) {
+        // Maps are not supported due to lack of a corresponding generator.
+        // Embedded collections are not supported for the same reason.
+        if (!dataType.isCollection())
+            return true;
+        List<com.datastax.driver.core.DataType> arguments = dataType.getTypeArguments();
+        if (arguments.size() >= 2)
+            return false;
+        for (com.datastax.driver.core.DataType argumentType : arguments) {
+            if (argumentType.isCollection()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public PartitionGenerator newGenerator(StressSettings settings)
     {
         if (generatorFactory == null)
@@ -689,7 +746,7 @@ public class StressProfile implements Serializable
                 maybeCreateSchema(settings);
                 maybeLoadSchemaInfo(settings);
                 if (generatorFactory == null)
-                    generatorFactory = new GeneratorFactory();
+                    generatorFactory = new GeneratorFactory(settings);
             }
         }
 
@@ -702,23 +759,36 @@ public class StressProfile implements Serializable
         final List<ColumnInfo> clusteringColumns = new ArrayList<>();
         final List<ColumnInfo> valueColumns = new ArrayList<>();
 
-        private GeneratorFactory()
+        private GeneratorFactory(StressSettings settings)
         {
+            List<ColumnInfo> unsupportedColumns = new ArrayList<>();
+            List<ColumnInfo> unsupportedCriticalColumns = new ArrayList<>();
             Set<com.datastax.driver.core.ColumnMetadata> keyColumns = com.google.common.collect.Sets.newHashSet(tableMetaData.getPrimaryKey());
 
             for (com.datastax.driver.core.ColumnMetadata metadata : tableMetaData.getPartitionKey())
-                partitionKeys.add(new ColumnInfo(metadata.getName(), metadata.getType().getName().toString(),
-                                                 metadata.getType().isCollection() ? metadata.getType().getTypeArguments().get(0).getName().toString() : "",
-                                                 columnConfigs.get(metadata.getName())));
+                pushColumnInfo(metadata, partitionKeys, true, unsupportedColumns, unsupportedCriticalColumns);
+
             for (com.datastax.driver.core.ColumnMetadata metadata : tableMetaData.getClusteringColumns())
-                clusteringColumns.add(new ColumnInfo(metadata.getName(), metadata.getType().getName().toString(),
-                                                     metadata.getType().isCollection() ? metadata.getType().getTypeArguments().get(0).getName().toString() : "",
-                                                     columnConfigs.get(metadata.getName())));
+                pushColumnInfo(metadata, clusteringColumns, true, unsupportedColumns, unsupportedCriticalColumns);
+
             for (com.datastax.driver.core.ColumnMetadata metadata : tableMetaData.getColumns())
                 if (!keyColumns.contains(metadata))
-                    valueColumns.add(new ColumnInfo(metadata.getName(), metadata.getType().getName().toString(),
-                                                    metadata.getType().isCollection() ? metadata.getType().getTypeArguments().get(0).getName().toString() : "",
-                                                    columnConfigs.get(metadata.getName())));
+                    pushColumnInfo(metadata, valueColumns, !(settings.errors.skipUnsupportedColumns), unsupportedColumns, unsupportedCriticalColumns);
+
+            if (unsupportedColumns.size() > 0) {
+                for (ColumnInfo column : unsupportedColumns) {
+                    System.err.printf("WARNING: Table '%s' has column '%s' of unsupported type\n",
+                            tableName, column.name);
+                }
+            }
+            if (unsupportedCriticalColumns.size() > 0) {
+                for (ColumnInfo column : unsupportedCriticalColumns) {
+                    System.err.printf("ERROR: Table '%s' has column '%s' of unsupported type\n",
+                            tableName, column.name);
+                }
+                assert false: "Can't continue due to the errors";
+            }
+
         }
 
         PartitionGenerator newGenerator(StressSettings settings)
@@ -732,6 +802,24 @@ public class StressProfile implements Serializable
             for (ColumnInfo columnInfo : columnInfos)
                 result.add(columnInfo.getGenerator());
             return result;
+        }
+
+        boolean pushColumnInfo(com.datastax.driver.core.ColumnMetadata metadata, List<ColumnInfo> targetList, boolean isCritical,
+                               List<ColumnInfo> unsupportedColumns, List<ColumnInfo> unsupportedCriticalColumns)
+        {
+            ColumnInfo column = new ColumnInfo(metadata.getName(), metadata.getType().getName().toString(),
+                    metadata.getType().isCollection() ? metadata.getType().getTypeArguments().get(0).getName().toString() : "",
+                    columnConfigs.get(metadata.getName()));
+            if (!isTypeSupported(metadata.getType())) {
+                if (isCritical) {
+                    unsupportedCriticalColumns.add(column);
+                } else {
+                    unsupportedColumns.add(column);
+                }
+                return false;
+            }
+            targetList.add(column);
+            return true;
         }
     }
 
